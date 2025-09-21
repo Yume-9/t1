@@ -1,0 +1,271 @@
+// TETRIS para Arduino UNO + OLED 128x64 + Botões A/B/C/D
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <avr/pgmspace.h>
+
+// ===== CONFIGURAÇÕES DO DISPLAY =====
+#define LARGURA_TELA 128
+#define ALTURA_TELA 64
+#define RESET_OLED -1
+Adafruit_SSD1306 display(LARGURA_TELA, ALTURA_TELA, &Wire, RESET_OLED);
+
+// ===== CAMPO DE JOGO =====
+const uint8_t COLS = 10, LINHAS = 16;
+const uint8_t LARGURA_CELULA = 6, ALTURA_CELULA = 4;
+const uint8_t POS_X_CAMPO = 2, POS_Y_CAMPO = 0;
+
+// ===== BOTÕES =====
+const uint8_t BTN_ROTACIONAR = 2;
+const uint8_t BTN_DIREITA    = 3;
+const uint8_t BTN_DESCER     = 4; // soft drop
+const uint8_t BTN_ESQUERDA   = 5;
+
+// ===== VARIÁVEIS DE JOGO =====
+unsigned long ultimoQueda = 0;
+unsigned long intervaloQueda = 700;
+uint16_t pontuacao = 0;
+uint8_t nivel = 0;
+uint32_t linhasLimpa = 0;
+
+// campo: 0 = vazio, 1 = ocupado
+uint8_t campo[LINHAS][COLS];
+
+// ===== TETROMINOS (4x4) =====
+const uint16_t tetrominos[7][4] PROGMEM = {
+  { 0x0F00, 0x2222, 0x00F0, 0x4444 },
+  { 0x0660, 0x0660, 0x0660, 0x0660 },
+  { 0x0E40, 0x4C40, 0x04E0, 0x4640 },
+  { 0x0E10, 0x2260, 0x08E0, 0x6440 },
+  { 0x0E80, 0x4460, 0x02E0, 0x6220 },
+  { 0x06C0, 0x4C80, 0x06C0, 0x4C80 },
+  { 0x0C60, 0x8C40, 0x0C60, 0x8C40 }
+};
+
+// ===== PEÇA ATUAL =====
+struct Peca {
+  int8_t x, y;
+  uint8_t tipo, rotacao;
+} atual;
+
+// ===== FILA DE PRÓXIMAS PEÇAS =====
+uint8_t prox[3], saco[7];
+int indiceSaco = 7;
+
+// ===== FUNÇÃO PARA PEGAR TETROMINO =====
+uint16_t pegarTet(uint8_t tipo, uint8_t rot) {
+  return pgm_read_word(&(tetrominos[tipo][rot & 3]));
+}
+
+// ===== EMBARALHAR SACO DE PEÇAS =====
+void embaralharSaco() {
+  for (int i = 0; i < 7; i++) saco[i] = i;
+  for (int i = 6; i > 0; i--) {
+    int j = random(0, i + 1);
+    uint8_t tmp = saco[i];
+    saco[i] = saco[j];
+    saco[j] = tmp;
+  }
+  indiceSaco = 0;
+}
+
+// ===== PEGAR PRÓXIMA PEÇA =====
+int8_t pegarProxima() {
+  if (indiceSaco >= 7) embaralharSaco();
+  return saco[indiceSaco++];
+}
+
+// ===== SPAWN DE NOVA PEÇA =====
+void novaPeca() {
+  atual.tipo = prox[0];
+  prox[0] = prox[1];
+  prox[1] = prox[2];
+  prox[2] = pegarProxima();
+  atual.rotacao = 0;
+  atual.x = 3;
+  atual.y = -1;
+}
+
+// ===== CHECAR COLISÃO =====
+bool colide(int nx, int ny, uint8_t ntipo, uint8_t nrot) {
+  uint16_t dados = pegarTet(ntipo, nrot);
+  for (int py = 0; py < 4; py++)
+    for (int px = 0; px < 4; px++)
+      if (dados & (1 << (15 - (py * 4 + px)))) {
+        int fx = nx + px, fy = ny + py;
+        if (fx < 0 || fx >= COLS || fy >= LINHAS || (fy >= 0 && campo[fy][fx])) return true;
+      }
+  return false;
+}
+
+// ===== FIXAR PEÇA =====
+void fixarPeca() {
+  uint16_t dados = pegarTet(atual.tipo, atual.rotacao);
+  for (int py = 0; py < 4; py++)
+    for (int px = 0; px < 4; px++)
+      if (dados & (1 << (15 - (py * 4 + px)))) {
+        int fx = atual.x + px, fy = atual.y + py;
+        if (fy >= 0 && fy < LINHAS && fx >= 0 && fx < COLS) campo[fy][fx] = 1;
+      }
+  limparLinhas();
+  novaPeca();
+}
+
+// ===== LIMPAR LINHAS =====
+void limparLinhas() {
+  uint8_t contLinhas = 0;
+  for (int r = LINHAS - 1; r >= 0; r--) {
+    bool cheia = true;
+    for (int c = 0; c < COLS; c++)
+      if (!campo[r][c]) { cheia = false; break; }
+    if (cheia) {
+      for (int rr = r; rr > 0; rr--)
+        for (int cc = 0; cc < COLS; cc++) campo[rr][cc] = campo[rr - 1][cc];
+      for (int cc = 0; cc < COLS; cc++) campo[0][cc] = 0;
+      r++;
+      contLinhas++;
+    }
+  }
+
+  if (contLinhas) {
+    uint16_t pontos = (contLinhas == 1 ? 40 * (nivel + 1) :
+                       contLinhas == 2 ? 100 * (nivel + 1) :
+                       contLinhas == 3 ? 300 * (nivel + 1) :
+                       1200 * (nivel + 1));
+    pontuacao += pontos;
+    linhasLimpa += contLinhas;
+    uint8_t novoNivel = linhasLimpa / 10;
+    if (novoNivel > nivel) {
+      nivel = novoNivel;
+      if (intervaloQueda > 100) intervaloQueda = max(100UL, intervaloQueda - 60);
+    }
+  }
+}
+
+// ===== DESENHAR CÉLULAS =====
+void desenharCelula(int l, int c) {
+  display.fillRect(POS_X_CAMPO + c * LARGURA_CELULA, POS_Y_CAMPO + l * ALTURA_CELULA, LARGURA_CELULA - 1, ALTURA_CELULA - 1, SSD1306_WHITE);
+}
+
+void desenharMiniPeca(int sx, int sy, uint8_t t, uint8_t r) {
+  uint16_t dados = pegarTet(t, r);
+  const int LARG_MINI = 3, ALT_MINI = 2;
+  for (int py = 0; py < 4; py++)
+    for (int px = 0; px < 4; px++)
+      if (dados & (1 << (15 - (py * 4 + px)))) display.fillRect(sx + px * LARG_MINI, sy + py * ALT_MINI, LARG_MINI - 1, ALT_MINI - 1, SSD1306_WHITE);
+}
+
+void desenhar() {
+  display.clearDisplay();
+
+  for (int r = 0; r < LINHAS; r++)
+    for (int c = 0; c < COLS; c++)
+      if (campo[r][c]) desenharCelula(r, c);
+
+  uint16_t dados = pegarTet(atual.tipo, atual.rotacao);
+  for (int py = 0; py < 4; py++)
+    for (int px = 0; px < 4; px++)
+      if (dados & (1 << (15 - (py * 4 + px)))) {
+        int fx = atual.x + px, fy = atual.y + py;
+        if (fy >= 0 && fx >= 0 && fx < COLS && fy < LINHAS) desenharCelula(fy, fx);
+      }
+
+  display.drawRect(POS_X_CAMPO - 1, POS_Y_CAMPO - 1, COLS * LARGURA_CELULA + 1, LINHAS * ALTURA_CELULA + 1, SSD1306_WHITE);
+
+  int painelX = POS_X_CAMPO + COLS * LARGURA_CELULA + 6, y = 0;
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(painelX, y);
+  display.print(F("PROX"));
+  for (int i = 0; i < 3; i++) desenharMiniPeca(painelX, y + 8 + i * 12, prox[i], 0);
+
+  y += 8 + 3 * 12 + 2;
+  display.setCursor(painelX, y);
+  display.print(F("PONTOS"));
+  y += 8;
+  display.setCursor(painelX, y);
+  display.print(pontuacao);
+  y += 10;
+  display.setCursor(painelX, y);
+  display.print(F("NIVEL "));
+  display.print(nivel);
+
+  display.display();
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 não encontrado"));
+    for (;;) {}
+  }
+  pinMode(BTN_ROTACIONAR, INPUT_PULLUP);
+  pinMode(BTN_DIREITA, INPUT_PULLUP);
+  pinMode(BTN_DESCER, INPUT_PULLUP);
+  pinMode(BTN_ESQUERDA, INPUT_PULLUP);
+  randomSeed(analogRead(A5));
+
+  for (int r = 0; r < LINHAS; r++)
+    for (int c = 0; c < COLS; c++) campo[r][c] = 0;
+
+  embaralharSaco();
+  for (int i = 0; i < 3; i++) prox[i] = pegarProxima();
+  novaPeca();
+  desenhar();
+}
+
+// ===== LOOP =====
+void loop() {
+  unsigned long agora = millis();
+  bool esquerda = !digitalRead(BTN_ESQUERDA),
+       direita = !digitalRead(BTN_DIREITA),
+       descer  = !digitalRead(BTN_DESCER),
+       rotacao = !digitalRead(BTN_ROTACIONAR);
+
+  static unsigned long ultEsq = 0, ultDir = 0, ultDescer = 0;
+  static bool ultRot = false;
+
+  if (esquerda && agora - ultEsq > 120) {
+    if (!colide(atual.x - 1, atual.y, atual.tipo, atual.rotacao)) atual.x--;
+    ultEsq = agora;
+  }
+  if (direita && agora - ultDir > 120) {
+    if (!colide(atual.x + 1, atual.y, atual.tipo, atual.rotacao)) atual.x++;
+    ultDir = agora;
+  }
+  if (descer && agora - ultDescer > 120) {
+    if (!colide(atual.x, atual.y + 1, atual.tipo, atual.rotacao)) {
+      atual.y++;
+      pontuacao++;
+    }
+    ultDescer = agora;
+  }
+  if (rotacao && !ultRot) {
+    uint8_t novaRot = (atual.rotacao + 1) & 3;
+    if (!colide(atual.x, atual.y, atual.tipo, novaRot)) atual.rotacao = novaRot;
+    else if (!colide(atual.x + 1, atual.y, atual.tipo, novaRot)) atual.x++;
+    else if (!colide(atual.x - 1, atual.y, atual.tipo, novaRot)) atual.x--;
+  }
+  ultRot = rotacao;
+
+  // queda automática
+  if (agora - ultimoQueda >= intervaloQueda) {
+    ultimoQueda = agora;
+    if (!colide(atual.x, atual.y + 1, atual.tipo, atual.rotacao)) atual.y++;
+    else {
+      if (atual.y < 0) { // game over
+        for (int r = 0; r < LINHAS; r++)
+          for (int c = 0; c < COLS; c++) campo[r][c] = 0;
+        pontuacao = nivel = linhasLimpa = 0;
+        intervaloQueda = 700;
+        embaralharSaco();
+        for (int i = 0; i < 3; i++) prox[i] = pegarProxima();
+        novaPeca();
+      } else fixarPeca();
+    }
+  }
+
+  desenhar();
+}
