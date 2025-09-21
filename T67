@@ -1,0 +1,489 @@
+Tetris para Arduino - Versão Simplificada
+
+Vou reescrever o código do Tetris de forma mais didática, mantendo todas as funcionalidades mas com uma estrutura mais clara para programadores iniciantes/intermediários.
+
+```cpp
+/*
+ * TETRIS para Arduino UNO
+ * Display: OLED 128x64
+ * Controles: 4 botões (A, B, C, D)
+ * 
+ * Versão simplificada para aprendizado
+ */
+
+// ===== BIBLIOTECAS =====
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===== CONFIGURAÇÃO DO DISPLAY =====
+#define LARGURA_TELA 128
+#define ALTURA_TELA 64
+#define ENDERECO_DISPLAY 0x3C
+
+Adafruit_SSD1306 display(LARGURA_TELA, ALTURA_TELA, &Wire, -1);
+
+// ===== CONFIGURAÇÃO DO JOGO =====
+#define COLUNAS 10     // Largura do campo
+#define LINHAS 16      // Altura do campo (4 linhas invisíveis)
+#define TAMANHO_CELULA 6  // Tamanho de cada bloco em pixels
+
+// Posição do campo na tela
+#define POS_X 2
+#define POS_Y 0
+
+// ===== BOTÕES =====
+#define BOTAO_GIRAR     2
+#define BOTAO_DIREITA   3
+#define BOTAO_DESCER    4
+#define BOTAO_ESQUERDA  5
+
+// ===== VARIÁVEIS DO JOGO =====
+unsigned long tempoUltimaQueda = 0;
+unsigned long intervaloQueda = 700;  // Tempo entre quedas (ms)
+uint16_t pontuacao = 0;
+uint8_t nivel = 0;
+uint32_t totalLinhasCompletas = 0;
+
+// Matriz do campo: 0 = vazio, 1 = preenchido
+uint8_t campo[LINHAS][COLUNAS];
+
+// ===== FORMAS DAS PEÇAS (TETROMINOS) =====
+// Cada peça é representada por 4 rotações (0°, 90°, 180°, 270°)
+// Cada rotação é um número hexadecimal que representa uma matriz 4x4
+const uint16_t tetrominos[7][4] = {
+  // Peça I (ciano)
+  { 0x0F00, 0x2222, 0x00F0, 0x4444 },
+  // Peça O (amarelo)
+  { 0x0660, 0x0660, 0x0660, 0x0660 },
+  // Peça T (roxo)
+  { 0x0E40, 0x4C40, 0x04E0, 0x4640 },
+  // Peça L (laranja)
+  { 0x0E10, 0x2260, 0x08E0, 0x6440 },
+  // Peça J (azul)
+  { 0x0E80, 0x4460, 0x02E0, 0x6220 },
+  // Peça S (verde)
+  { 0x06C0, 0x4C80, 0x06C0, 0x4C80 },
+  // Peça Z (vermelho)
+  { 0x0C60, 0x8C40, 0x0C60, 0x8C40 }
+};
+
+// ===== PEÇA ATUAL =====
+struct Peça {
+  int8_t x, y;        // Posição no campo
+  uint8_t tipo;       // Tipo de peça (0-6)
+  uint8_t rotacao;    // Rotação atual (0-3)
+} peçaAtual;
+
+// ===== FILA DE PRÓXIMAS PEÇAS =====
+uint8_t proximas[3];  // Próximas 3 peças
+uint8_t saco[7];      // Saco com todas as peças
+int indiceSaco = 7;   // Índice atual no saco
+
+// ===== FUNÇÕES DO JOGO =====
+
+// Obtém os dados de uma peça específica
+uint16_t obterFormaPeça(uint8_t tipo, uint8_t rotacao) {
+  return tetrominos[tipo][rotacao % 4];
+}
+
+// Embaralha as peças no saco (sistema "7-bag")
+void embaralharSaco() {
+  // Preenche o saco com todas as peças
+  for (int i = 0; i < 7; i++) {
+    saco[i] = i;
+  }
+  
+  // Embaralha usando o algoritmo Fisher-Yates
+  for (int i = 6; i > 0; i--) {
+    int j = random(0, i + 1);
+    uint8_t temp = saco[i];
+    saco[i] = saco[j];
+    saco[j] = temp;
+  }
+  
+  indiceSaco = 0;
+}
+
+// Obtém a próxima peça do saco
+uint8_t obterProximaPeça() {
+  if (indiceSaco >= 7) {
+    embaralharSaco();
+  }
+  return saco[indiceSaco++];
+}
+
+// Cria uma nova peça na parte superior do campo
+void criarNovaPeça() {
+  peçaAtual.tipo = proximas[0];
+  proximas[0] = proximas[1];
+  proximas[1] = proximas[2];
+  proximas[2] = obterProximaPeça();
+  
+  peçaAtual.rotacao = 0;
+  peçaAtual.x = 3;     // Posição central
+  peçaAtual.y = -1;    // Começa acima do campo
+}
+
+// Verifica se há colisão em uma posição específica
+bool verificarColisao(int novoX, int novoY, uint8_t tipo, uint8_t rotacao) {
+  uint16_t forma = obterFormaPeça(tipo, rotacao);
+  
+  // Verifica cada célula da peça 4x4
+  for (int linha = 0; linha < 4; linha++) {
+    for (int coluna = 0; coluna < 4; coluna++) {
+      // Verifica se esta célula está preenchida na peça
+      if (forma & (1 << (15 - (linha * 4 + coluna)))) {
+        int posX = novoX + coluna;
+        int posY = novoY + linha;
+        
+        // Verifica se está fora dos limites ou colidindo com bloco existente
+        if (posX < 0 || posX >= COLUNAS || posY >= LINHAS || 
+            (posY >= 0 && campo[posY][posX])) {
+          return true;
+        }
+      }
+    }
+  }
+  
+  return false;
+}
+
+// Fixa a peça atual no campo
+void fixarPeça() {
+  uint16_t forma = obterFormaPeça(peçaAtual.tipo, peçaAtual.rotacao);
+  
+  // Marca as células ocupadas pela peça no campo
+  for (int linha = 0; linha < 4; linha++) {
+    for (int coluna = 0; coluna < 4; coluna++) {
+      if (forma & (1 << (15 - (linha * 4 + coluna)))) {
+        int posX = peçaAtual.x + coluna;
+        int posY = peçaAtual.y + linha;
+        
+        if (posY >= 0 && posY < LINHAS && posX >= 0 && posX < COLUNAS) {
+          campo[posY][posX] = 1;
+        }
+      }
+    }
+  }
+  
+  // Verifica e remove linhas completas
+  verificarLinhasCompletas();
+  
+  // Cria uma nova peça
+  criarNovaPeça();
+}
+
+// Verifica e remove linhas completas
+void verificarLinhasCompletas() {
+  uint8_t linhasRemovidas = 0;
+  
+  // Verifica cada linha de baixo para cima
+  for (int linha = LINHAS - 1; linha >= 0; linha--) {
+    bool linhaCompleta = true;
+    
+    // Verifica se todos os blocos da linha estão preenchidos
+    for (int coluna = 0; coluna < COLUNAS; coluna++) {
+      if (!campo[linha][coluna]) {
+        linhaCompleta = false;
+        break;
+      }
+    }
+    
+    // Se a linha está completa, remove e desce as linhas acima
+    if (linhaCompleta) {
+      for (int l = linha; l > 0; l--) {
+        for (int c = 0; c < COLUNAS; c++) {
+          campo[l][c] = campo[l - 1][c];
+        }
+      }
+      
+      // Limpa a linha do topo
+      for (int c = 0; c < COLUNAS; c++) {
+        campo[0][c] = 0;
+      }
+      
+      linha++; // Reverifica a mesma posição
+      linhasRemovidas++;
+    }
+  }
+  
+  // Atualiza pontuação e nível se linhas foram removidas
+  if (linhasRemovidas > 0) {
+    // Sistema de pontuação padrão do Tetris
+    switch (linhasRemovidas) {
+      case 1: pontuacao += 40 * (nivel + 1); break;
+      case 2: pontuacao += 100 * (nivel + 1); break;
+      case 3: pontuacao += 300 * (nivel + 1); break;
+      case 4: pontuacao += 1200 * (nivel + 1); break;
+    }
+    
+    totalLinhasCompletas += linhasRemovidas;
+    
+    // Aumenta o nível a cada 10 linhas
+    uint8_t novoNivel = totalLinhasCompletas / 10;
+    if (novoNivel > nivel) {
+      nivel = novoNivel;
+      // Aumenta a velocidade (diminui o intervalo)
+      intervaloQueda = max(100, intervaloQueda - 60);
+    }
+  }
+}
+
+// ===== FUNÇÕES DE VISUALIZAÇÃO =====
+
+// Desenha um bloco na posição especificada
+void desenharBloco(int linha, int coluna) {
+  display.fillRect(
+    POS_X + coluna * TAMANHO_CELULA, 
+    POS_Y + linha * TAMANHO_CELULA, 
+    TAMANHO_CELULA - 1, 
+    TAMANHO_CELULA - 1, 
+    SSD1306_WHITE
+  );
+}
+
+// Desenha uma peça em miniatura (para a área de próximas peças)
+void desenharPeçaMiniatura(int x, int y, uint8_t tipo, uint8_t rotacao) {
+  uint16_t forma = obterFormaPeça(tipo, rotacao);
+  const int LARGURA_MINI = 3;
+  const int ALTURA_MINI = 2;
+  
+  for (int linha = 0; linha < 4; linha++) {
+    for (int coluna = 0; coluna < 4; coluna++) {
+      if (forma & (1 << (15 - (linha * 4 + coluna)))) {
+        display.fillRect(
+          x + coluna * LARGURA_MINI, 
+          y + linha * ALTURA_MINI, 
+          LARGURA_MINI - 1, 
+          ALTURA_MINI - 1, 
+          SSD1306_WHITE
+        );
+      }
+    }
+  }
+}
+
+// Desenha toda a cena do jogo
+void desenharCena() {
+  display.clearDisplay();
+  
+  // Desenha o campo com blocos fixos
+  for (int linha = 0; linha < LINHAS; linha++) {
+    for (int coluna = 0; coluna < COLUNAS; coluna++) {
+      if (campo[linha][coluna]) {
+        desenharBloco(linha, coluna);
+      }
+    }
+  }
+  
+  // Desenha a peça atual
+  uint16_t forma = obterFormaPeça(peçaAtual.tipo, peçaAtual.rotacao);
+  for (int linha = 0; linha < 4; linha++) {
+    for (int coluna = 0; coluna < 4; coluna++) {
+      if (forma & (1 << (15 - (linha * 4 + coluna)))) {
+        int posX = peçaAtual.x + coluna;
+        int posY = peçaAtual.y + linha;
+        
+        if (posY >= 0 && posX >= 0 && posX < COLUNAS && posY < LINHAS) {
+          desenharBloco(posY, posX);
+        }
+      }
+    }
+  }
+  
+  // Desenha a borda do campo
+  display.drawRect(
+    POS_X - 1, 
+    POS_Y - 1, 
+    COLUNAS * TAMANHO_CELULA + 1, 
+    LINHAS * TAMANHO_CELULA + 1, 
+    SSD1306_WHITE
+  );
+  
+  // ===== PAINEL DE INFORMAÇÕES =====
+  int painelX = POS_X + COLUNAS * TAMANHO_CELULA + 6;
+  int y = 0;
+  
+  // Próximas peças
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(painelX, y);
+  display.print(F("PROXIMAS"));
+  
+  for (int i = 0; i < 3; i++) {
+    desenharPeçaMiniatura(painelX, y + 10 + i * 12, proximas[i], 0);
+  }
+  
+  // Pontuação
+  y += 10 + 3 * 12 + 4;
+  display.setCursor(painelX, y);
+  display.print(F("PONTOS"));
+  y += 8;
+  display.setCursor(painelX, y);
+  display.print(pontuacao);
+  
+  // Nível
+  y += 10;
+  display.setCursor(painelX, y);
+  display.print(F("NIVEL "));
+  display.print(nivel);
+  
+  display.display();
+}
+
+// ===== CONFIGURAÇÃO INICIAL =====
+void setup() {
+  Serial.begin(115200);
+  
+  // Inicializa o display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, ENDERECO_DISPLAY)) {
+    Serial.println(F("Erro: Display não encontrado!"));
+    while (true); // Trava se o display não for encontrado
+  }
+  
+  // Configura os botões
+  pinMode(BOTAO_GIRAR, INPUT_PULLUP);
+  pinMode(BOTAO_DIREITA, INPUT_PULLUP);
+  pinMode(BOTAO_DESCER, INPUT_PULLUP);
+  pinMode(BOTAO_ESQUERDA, INPUT_PULLUP);
+  
+  // Inicializa o gerador de números aleatórios
+  randomSeed(analogRead(A5));
+  
+  // Limpa o campo de jogo
+  for (int linha = 0; linha < LINHAS; linha++) {
+    for (int coluna = 0; coluna < COLUNAS; coluna++) {
+      campo[linha][coluna] = 0;
+    }
+  }
+  
+  // Prepara o sistema de peças
+  embaralharSaco();
+  for (int i = 0; i < 3; i++) {
+    proximas[i] = obterProximaPeça();
+  }
+  
+  // Cria a primeira peça
+  criarNovaPeça();
+  
+  // Desenha a cena inicial
+  desenharCena();
+}
+
+// ===== LOOP PRINCIPAL =====
+void loop() {
+  unsigned long tempoAtual = millis();
+  
+  // Lê o estado dos botões (ativo em LOW por causa do PULLUP)
+  bool girar = !digitalRead(BOTAO_GIRAR);
+  bool direita = !digitalRead(BOTAO_DIREITA);
+  bool descer = !digitalRead(BOTAO_DESCER);
+  bool esquerda = !digitalRead(BOTAO_ESQUERDA);
+  
+  // Variáveis para controlar a repetição de botões
+  static unsigned long ultimoEsquerda = 0, ultimoDireita = 0, ultimoDescer = 0;
+  static bool ultimoGirar = false;
+  
+  // ===== CONTROLES =====
+  
+  // Movimento para esquerda
+  if (esquerda && tempoAtual - ultimoEsquerda > 120) {
+    if (!verificarColisao(peçaAtual.x - 1, peçaAtual.y, peçaAtual.tipo, peçaAtual.rotacao)) {
+      peçaAtual.x--;
+    }
+    ultimoEsquerda = tempoAtual;
+  }
+  
+  // Movimento para direita
+  if (direita && tempoAtual - ultimoDireita > 120) {
+    if (!verificarColisao(peçaAtual.x + 1, peçaAtual.y, peçaAtual.tipo, peçaAtual.rotacao)) {
+      peçaAtual.x++;
+    }
+    ultimoDireita = tempoAtual;
+  }
+  
+  // Descida rápida (soft drop)
+  if (descer && tempoAtual - ultimoDescer > 120) {
+    if (!verificarColisao(peçaAtual.x, peçaAtual.y + 1, peçaAtual.tipo, peçaAtual.rotacao)) {
+      peçaAtual.y++;
+      pontuacao++; // Pontuação extra por soft drop
+    }
+    ultimoDescer = tempoAtual;
+  }
+  
+  // Rotação da peça
+  if (girar && !ultimoGirar) {
+    uint8_t novaRotacao = (peçaAtual.rotacao + 1) % 4;
+    
+    // Tenta rotacionar, com ajustes laterais se necessário (wall kicks)
+    if (!verificarColisao(peçaAtual.x, peçaAtual.y, peçaAtual.tipo, novaRotacao)) {
+      peçaAtual.rotacao = novaRotacao;
+    } else if (!verificarColisao(peçaAtual.x + 1, peçaAtual.y, peçaAtual.tipo, novaRotacao)) {
+      peçaAtual.x++;
+      peçaAtual.rotacao = novaRotacao;
+    } else if (!verificarColisao(peçaAtual.x - 1, peçaAtual.y, peçaAtual.tipo, novaRotacao)) {
+      peçaAtual.x--;
+      peçaAtual.rotacao = novaRotacao;
+    }
+  }
+  ultimoGirar = girar;
+  
+  // ===== QUEDA AUTOMÁTICA =====
+  if (tempoAtual - tempoUltimaQueda >= intervaloQueda) {
+    tempoUltimaQueda = tempoAtual;
+    
+    // Tenta mover a peça para baixo
+    if (!verificarColisao(peçaAtual.x, peçaAtual.y + 1, peçaAtual.tipo, peçaAtual.rotacao)) {
+      peçaAtual.y++;
+    } else {
+      // Se não pode descer, verifica se é game over
+      if (peçaAtual.y < 0) {
+        // Game over - reinicia o jogo
+        for (int linha = 0; linha < LINHAS; linha++) {
+          for (int coluna = 0; coluna < COLUNAS; coluna++) {
+            campo[linha][coluna] = 0;
+          }
+        }
+        pontuacao = 0;
+        nivel = 0;
+        totalLinhasCompletas = 0;
+        intervaloQueda = 700;
+        
+        embaralharSaco();
+        for (int i = 0; i < 3; i++) {
+          proximas[i] = obterProximaPeça();
+        }
+        criarNovaPeça();
+      } else {
+        // Fixa a peça no campo e cria uma nova
+        fixarPeça();
+      }
+    }
+  }
+  
+  // Atualiza a tela
+  desenharCena();
+}
+```
+
+Principais melhorias para entendimento:
+
+1. Nomes em português: Todas as variáveis e funções têm nomes em português
+2. Comentários detalhados: Cada seção tem explicações claras
+3. Estrutura simplificada: Código organizado de forma linear e lógica
+4. Remoção de complexidades desnecessárias: Uso de PROGMEM removido para simplificar
+5. Explicação de algoritmos: Comentários explicando o funcionamento de cada parte
+
+Funcionalidades mantidas:
+
+· Sistema de peças com rotações
+· Sistema "7-bag" para distribuição justa de peças
+· Wall kicks (ajustes laterais ao rotacionar)
+· Sistema de pontuação e níveis
+· Soft drop (descida rápida)
+· Game over e reinício
+· Display de próximas peças
+
+Este código mantém todas as funcionalidades do original mas é muito mais fácil de entender e modificar para programadores em aprendizado.
